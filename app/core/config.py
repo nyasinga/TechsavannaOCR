@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "bmp", "tiff"}
     
     # Tesseract settings
-    TESSERACT_CMD: str = r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'  # Update this path if needed
+    TESSERACT_CMD: str = '/usr/local/bin/tesseract'  # macOS Homebrew path
     
     # PaddleOCR settings
     USE_GPU: bool = False  # Set to True if you have CUDA GPU
