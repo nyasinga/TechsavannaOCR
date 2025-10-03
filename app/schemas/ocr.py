@@ -81,6 +81,81 @@ class OCRRequest(BaseModel):
             }
         }
 
+class BusinessPermitResponse(BaseModel):
+    """Response model for Business Permit extraction"""
+    # Document Information
+    document_type: str = Field("business_permit", description="Type of document")
+    permit_number: Optional[str] = Field(None, description="Business permit number")
+    receipt_number: Optional[str] = Field(None, description="Payment receipt number")
+    
+    # Business Information
+    business_name: Optional[str] = Field(None, description="Registered business name")
+    trading_name: Optional[str] = Field(None, description="Trading name (if different from registered name)")
+    business_activity: Optional[str] = Field(None, description="Primary business activity")
+    business_category: Optional[str] = Field(None, description="Category of business")
+    
+    # Location Information
+    physical_address: Optional[Dict[str, str]] = Field(
+        None,
+        description="Structured address information"
+    )
+    ward: Optional[str] = Field(None, description="Ward where business is located")
+    sub_county: Optional[str] = Field(None, description="Sub-county where business is located")
+    county: Optional[str] = Field(None, description="County where business is registered")
+    
+    # Permit Details
+    permit_type: Optional[str] = Field(None, description="Type of business permit")
+    date_issued: Optional[str] = Field(None, description="Date when permit was issued (YYYY-MM-DD)")
+    expiry_date: Optional[str] = Field(None, description="Date when permit expires (YYYY-MM-DD)")
+    
+    # Financial Information
+    permit_fee: Optional[float] = Field(None, description="Amount paid for the permit")
+    payment_date: Optional[str] = Field(None, description="Date of payment (YYYY-MM-DD)")
+    
+    # Contact Information
+    owner_name: Optional[str] = Field(None, description="Name of business owner")
+    phone_number: Optional[str] = Field(None, description="Contact phone number")
+    email: Optional[str] = Field(None, description="Contact email address")
+    
+    # System Information
+    processing_time: float = Field(..., description="Time taken to process the document in seconds", gt=0)
+    engine_used: str = Field(..., description="The OCR engine used for text extraction")
+    confidence: Optional[float] = Field(None, description="Confidence score of the extraction (0-1)")
+    raw_text: Optional[str] = Field(None, description="Raw OCR text (useful for debugging)")
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "document_type": "business_permit",
+                "permit_number": "BP/2023/12345",
+                "receipt_number": "RCPT/2023/67890",
+                "business_name": "JAMBO TRADERS LIMITED",
+                "trading_name": "JAMBO SUPERMARKET",
+                "business_activity": "RETAIL TRADING",
+                "business_category": "GENERAL SHOP",
+                "physical_address": {
+                    "building": "PLAZA BUILDING",
+                    "street": "MAIN STREET",
+                    "town": "NAIROBI"
+                },
+                "ward": "CENTRAL WARD",
+                "sub_county": "WESTLANDS",
+                "county": "NAIROBI CITY",
+                "permit_type": "ANNUAL BUSINESS PERMIT",
+                "date_issued": "2023-01-15",
+                "expiry_date": "2023-12-31",
+                "permit_fee": 15000.00,
+                "payment_date": "2023-01-10",
+                "owner_name": "JOHN DOE MWANGI",
+                "phone_number": "+254712345678",
+                "email": "info@jambotraders.co.ke",
+                "processing_time": 1.25,
+                "engine_used": "tesseract",
+                "confidence": 0.92,
+                "raw_text": "..."
+            }
+        }
+
 class KRAPINResponse(BaseModel):
     """Response model for KRA PIN certificate extraction"""
     taxpayer_name: Optional[str] = Field(None, description="Tax Payer Name as printed on the certificate")

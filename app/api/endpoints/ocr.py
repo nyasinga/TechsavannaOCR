@@ -3,15 +3,23 @@ import io
 import re
 import time
 import json
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form, Request, status
-from fastapi.responses import JSONResponse
-from PIL import Image
-import numpy as np
+from fastapi import APIRouter, File, UploadFile, HTTPException, status, Form, Request
+from typing import List, Optional, Dict, Any, Union, Tuple
+import time
+import re
 import cv2
+import numpy as np
+from datetime import datetime
 from io import BytesIO
-from typing import Optional
+from PIL import Image
+import logging
 
-from app.schemas.ocr import OCRRequest, OCRResponse, OCREngine, IDDocumentResponse, KRAPINResponse
+logger = logging.getLogger(__name__)
+
+from app.schemas.ocr import (
+    OCRRequest, OCRResponse, OCREngine, 
+    IDDocumentResponse, KRAPINResponse, BusinessPermitResponse
+)
 from app.schemas.classifier import (
     ClassificationRequest, 
     ClassificationResponse, 
@@ -245,6 +253,275 @@ async def extract_text(request: Request):
                 "solution": "Please try again or contact support if the problem persists"
             }
         )
+
+@router.post("/extract-business-permit", response_model=BusinessPermitResponse)
+async def extract_business_permit(
+    file: UploadFile = File(...),
+    engine: OCREngine = OCREngine.TESSERACT,
+    include_raw: str = Form("false")
+):
+    """
+    Extract key fields from a Business Permit document.
+    
+    This endpoint processes an image of a business permit and extracts structured data
+    including business details, permit information, and payment details.
+    """
+    start_time = time.time()
+    try:
+        # Read and validate the uploaded file
+        contents = await file.read()
+        if not contents:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty"
+            )
+            
+        # Convert image to OpenCV format
+        nparr = np.frombuffer(contents, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if image is None:
+            from PIL import Image
+            pil_image = Image.open(BytesIO(contents))
+            image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        
+        # Preprocess the image for better OCR
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply adaptive thresholding to handle different lighting conditions
+        processed_image = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Extract text using the selected OCR engine
+        if engine == OCREngine.TESSERACT:
+            # Import tesseract_ocr here or ensure it's available
+            import pytesseract
+            custom_config = r'--oem 3 --psm 6'
+            raw_text = pytesseract.image_to_string(processed_image, config=custom_config)
+            confidence = 0.0  # Tesseract doesn't provide confidence by default
+        else:  # PaddleOCR
+            # If using PaddleOCR, you'll need to import and initialize it
+            # For now, using tesseract as fallback
+            import pytesseract
+            custom_config = r'--oem 3 --psm 6'
+            raw_text = pytesseract.image_to_string(processed_image, config=custom_config)
+            confidence = 0.0
+        
+        # Preprocess the text for better pattern matching
+        raw_text = preprocess_business_permit_text(raw_text)
+        
+        # Initialize response with default values
+        response = {
+            "document_type": "business_permit",
+            "processing_time": time.time() - start_time,
+            "engine_used": engine.value,
+            "raw_text": raw_text if include_raw.lower() == "true" else None,
+            "confidence": confidence
+        }
+        
+        # Function to clean and normalize extracted text
+        def clean_text(text):
+            if not text:
+                return None
+            # Remove special characters and normalize spaces
+            text = re.sub(r'[^\w\s\-\.,]', ' ', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text if text else None
+            
+        # Extract fields using patterns specific to the document format
+        patterns = {
+            "permit_number": [
+                r'(?:permit|license|leseni|nambari ya leseni)[\s:]*[\n\s]*([A-Z0-9/\-]+)',
+                r'B\.?P\.?[\s\/\-]?\s*(\d+[\/\-]?\d*)'  # Matches BP-1234, BP/2023/1234, etc.
+            ],
+            "receipt_number": [
+                r'(?:receipt|nambari ya risiti)[\s:]*[\n\s]*([A-Z0-9/\-]+)',
+                r'RCPT[\s\/\-]?\s*(\d+[\/\-]?\d*)'  # Matches RCPT-1234, RCPT/2023/1234, etc.
+            ],
+            "business_name": [
+                r'(?:jina la biashara|business name)[\s:]*[\n\s]*([^\n]+?)(?=\s*\n\s*(?:jina la mwenyewe|trading name|namba ya simu|county|mkoa))',
+                r'jina la biashara[\s:]*[\n\s]*([^\n]+)'
+            ],
+            "trading_name": [
+                r'(?:jina la kibiashara|trading name|jina la biashara)[\s:]*[\n\s]*([^\n]+?)(?=\s*\n\s*(?:namba ya simu|county|mkoa|location))',
+                r'trading[\s]+name[\s:]*[\n\s]*([^\n]+)'
+            ],
+            "owner_name": [
+                r'(?:jina la mwenyewe|owner\'?s? name)[\s:]*[\n\s]*([^\n]+?)(?=\s*\n\s*(?:namba ya simu|county|mkoa|location))',
+                r'mwenyewe[\s:]*[\n\s]*([^\n]+)'
+            ],
+            "phone_number": [
+                r'(?:namba ya simu|phone number)[\s:]*[\n\s]*([+\d\s\-()]+)',
+                r'(?:simu|phone)[\s:]*[\n\s]*([+\d\s\-()]+)'
+            ],
+            "county": [
+                r'(?:mkoa|county)[\s:]*[\n\s]*([^\n,]+?)(?=\s*\n|,|$|\s{2,})',
+                r'county[\s:]*[\n\s]*([^\n,]+)'
+            ],
+            "sub_county": [
+                r'(?:wilaya|sub[\s-]?county)[\s:]*[\n\s]*([^\n,]+?)(?=\s*\n|,|$|\s{2,})'
+            ],
+            "ward": [
+                r'(?:kata|ward)[\s:]*[\n\s]*([^\n,]+?)(?=\s*\n|,|$|\s{2,})'
+            ],
+            "business_activity": [
+                r'(?:aina ya biashara|business activity)[\s:]*[\n\s]*([^\n]+?)(?=\s*\n|$)',
+                r'business[\s\n]*activit(?:y|ies)[\s\n:]*([^\n]+?)(?=\s*\n|$)',
+                r'nature[\s\n]*of[\s\n]*business[\s\n:]*([^\n]+?)(?=\s*\n|$)'
+            ],
+            "permit_type": [
+                r'(?:aina ya leseni|permit type)[\s:]*[\n\s]*([^\n]+?)(?=\s*\n|$)'
+            ],
+            "permit_fee": [
+                r'total[\s\n]*amount[\s\n:]*K?SH[\s\n:]*([\d,\s]+(?:\.[\d]{2})?)(?=\s*\n|$)',
+                r'permit[\s\n]*fee[\s\n:]*K?SH[\s\n:]*([\d,\s]+(?:\.[\d]{2})?)(?=\s*\n|$)',
+                r'amount[\s\n]*paid[\s\n:]*K?SH[\s\n:]*([\d,\s]+(?:\.[\d]{2})?)(?=\s*\n|$)'
+            ],
+            "date_issued": [
+                r'date[\s\n]*of[\s\n]*issue[\s\n:]*([\d]{1,2}[./-]\s*[\d]{1,2}[./-]\s*[\d]{2,4})',
+                r'issued[\s\n]*date[\s\n:]*([\d]{1,2}[./-]\s*[\d]{1,2}[./-]\s*[\d]{2,4})'
+            ],
+            "expiry_date": [
+                r'expir(?:y|ation)[\s\n]*date[\s\n:]*([\d]{1,2}[./-]\s*[\d]{1,2}[./-]\s*[\d]{2,4})',
+                r'valid[\s\n]*until[\s\n:]*([\d]{1,2}[./-]\s*[\d]{1,2}[./-]\s*[\d]{2,4})'
+            ],
+            "email": [
+                r'email[\s\n]*(?:address)?[\s\n:]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?=\s*\n|$)'
+            ]
+        }
+        
+        # Extract data using patterns
+        for field, regex_list in patterns.items():
+            for pattern in regex_list:
+                match = re.search(pattern, raw_text, re.IGNORECASE | re.MULTILINE)
+                if match:
+                    # Clean up the extracted value
+                    value = clean_text(match.group(1))
+                    if not value:
+                        continue
+                        
+                    # Special handling for dates to standardize format
+                    if field in ["date_issued", "expiry_date"]:
+                        # Try to parse and reformat the date
+                        try:
+                            from datetime import datetime
+                            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%y"):
+                                try:
+                                    dt = datetime.strptime(value, fmt)
+                                    value = dt.strftime("%Y-%m-%d")
+                                    break
+                                except ValueError:
+                                    continue
+                        except Exception:
+                            pass  # Keep original format if parsing fails
+                    
+                    # Special handling for amounts/currency
+                    elif field == "permit_fee":
+                        try:
+                            # Remove any non-numeric characters except decimal point
+                            value = re.sub(r'[^\d.]', '', value)
+                            if value:
+                                value = float(value)
+                        except (ValueError, TypeError):
+                            pass  # Keep original value if conversion fails
+                    
+                    response[field] = value
+                    break
+        
+        # Extract address components
+        address_components = {}
+        
+        # Try to extract structured address
+        address_match = re.search(
+            r'address[\s\n:]*([^\n]+?)(?=\n\s*\w+[\s\n:]|$|\s*$)',
+            raw_text,
+            re.IGNORECASE | re.MULTILINE
+        )
+        
+        if address_match:
+            address_text = address_match.group(1).strip()
+            address_components["full"] = address_text
+            
+            # Try to extract specific address components
+            for comp in ["building", "street", "road", "avenue", "lane", "plot"]:
+                match = re.search(
+                    fr'(?:{comp})[\s\n]*(?:name|no\.?|number)?[\s\n:]*([^,\n]+)',
+                    address_text,
+                    re.IGNORECASE
+                )
+                if match:
+                    address_components[comp] = match.group(1).strip()
+        
+        if address_components:
+            response["physical_address"] = address_components
+        
+        # Extract location details (ward, sub-county, county) if not already found
+        location_patterns = {
+            "ward": r'ward[\s\n:]*([^\n,]+)',
+            "sub_county": r'sub[\s-]?county[\s\n:]*([^\n,]+)',
+            "county": r'county[\s\n:]*([^\n,]+)'
+        }
+        
+        for field, pattern in location_patterns.items():
+            if field not in response:  # Only extract if not already found
+                match = re.search(pattern, raw_text, re.IGNORECASE)
+                if match:
+                    response[field] = clean_text(match.group(1))
+        
+        # Clean up the response by removing None values
+        response = {k: v for k, v in response.items() if v is not None}
+        
+        return response
+        
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error processing business permit: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing business permit: {str(e)}"
+        )
+
+
+def preprocess_business_permit_text(text: str) -> str:
+    """
+    Preprocess OCR text from business permits to improve field extraction.
+    
+    Args:
+        text: Raw OCR text
+        
+    Returns:
+        str: Preprocessed text with improved structure and readability
+    """
+    if not text:
+        return ""
+        
+    # Remove common OCR artifacts and noise
+    text = re.sub(r'[\|_\[\]{}()]', ' ', text)
+    
+    # Normalize whitespace and line breaks
+    text = ' '.join(text.split())
+    
+    # Common OCR error corrections
+    corrections = [
+        (r'(\b[A-Z])([A-Z]+\b)', lambda m: m.group(1) + ' ' + m.group(2)),  # Split ALLCAPS words
+        (r'([a-z])([A-Z])', r'\1 \2'),  # Split camelCase words
+        (r'(\d)([A-Za-z])', r'\1 \2'),  # Split numbers from letters
+        (r'([A-Za-z])(\d)', r'\1 \2'),  # Split letters from numbers
+        (r'([a-z])([A-Z][a-z])', r'\1 \2'),  # Split mixed case words
+    ]
+    
+    for pattern, repl in corrections:
+        text = re.sub(pattern, repl, text)
+    
+    # Remove any remaining special characters except basic punctuation
+    text = re.sub(r'[^\w\s\.\,\-\/]', ' ', text)
+    
+    # Normalize whitespace again after all replacements
+    text = ' '.join(text.split())
+    
+    return text
 
 @router.post("/extract-kra-pin", response_model=KRAPINResponse)
 async def extract_kra_pin_details(
