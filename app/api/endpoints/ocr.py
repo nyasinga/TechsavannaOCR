@@ -3,15 +3,24 @@ import io
 import re
 import time
 import json
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form, Request
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form, Request, status
 from fastapi.responses import JSONResponse
 from PIL import Image
 import numpy as np
 import cv2
+from io import BytesIO
+from typing import Optional
 
 from app.schemas.ocr import OCRRequest, OCRResponse, OCREngine, IDDocumentResponse, KRAPINResponse
+from app.schemas.classifier import (
+    ClassificationRequest, 
+    ClassificationResponse, 
+    ClassificationMode,
+    DocumentType
+)
 from app.services.tesseract_service import tesseract_ocr
 from app.services.paddle_service import paddle_ocr
+from app.services.document_classifier import classifier
 from app.utils.image_processing import validate_image, preprocess_image
 from app.core.config import settings
 
@@ -31,6 +40,79 @@ class OCRRequestForm:
         self.engine = engine
         self.preprocess = preprocess.lower() == "true"
         self.include_word_boxes = include_word_boxes.lower() == "true"
+
+@router.post("/classify-document", response_model=ClassificationResponse)
+async def classify_document(
+    request: Request,
+    mode: ClassificationMode = Form(ClassificationMode.IMAGE),
+    file: Optional[UploadFile] = File(None),
+    text: Optional[str] = Form(None),
+    confidence_threshold: float = Form(0.5),
+    top_k: int = Form(3)
+):
+    """
+    Classify a document as either a KRA PIN certificate or National ID.
+    
+    Supports both direct text input and image files.
+    """
+    start_time = time.time()
+    
+    try:
+        # Validate input based on mode
+        if mode == ClassificationMode.IMAGE:
+            if not file:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="File is required when mode is 'image'"
+                )
+            
+            # Read and process image
+            contents = await file.read()
+            if not contents:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Uploaded file is empty"
+                )
+                
+            # Use PaddleOCR for text extraction (better for document text)
+            nparr = np.frombuffer(contents, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if image is None:
+                pil_image = Image.open(BytesIO(contents))
+                image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+            
+            # Extract text using PaddleOCR (better for document text)
+            ocr_result = paddle_ocr.extract_text(
+                image=image,
+                language="en",
+                preprocess=True
+            )
+            text_content = ocr_result.text
+            
+        else:  # TEXT mode
+            if not text:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Text is required when mode is 'text'"
+                )
+            text_content = text
+        
+        # Classify the document
+        result = classifier.classify_text(
+            text=text_content,
+            top_k=min(max(1, top_k), 5)  # Ensure top_k is between 1 and 5
+        )
+        
+        # Add processing time
+        result["processing_time"] = time.time() - start_time
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing document: {str(e)}"
+        )
 
 @router.post("/extract-text", response_model=OCRResponse)
 async def extract_text(request: Request):
@@ -213,116 +295,248 @@ async def extract_kra_pin_details(
 
         lines = [line.strip() for line in text.split("\n") if line.strip()]
 
+        # Initialize all fields with None
         taxpayer_name = None
         email_address = None
         personal_identification_number = None
+        certificate_date = None
+        registered_address = {}
+        county = None
+        district = None
+        postal_code = None
+        tax_obligations = []
 
-        # === DIRECT PATTERN MATCHING APPROACH ===
-        # Since table parsing is unreliable, let's use direct pattern matching
+        # === EXTRACT CERTIFICATE DATE ===
+        cert_date_match = re.search(r'Certificate\s*Date\s*:\s*(\d{1,2}/\d{1,2}/\d{4})', text, re.IGNORECASE)
+        if cert_date_match:
+            try:
+                from datetime import datetime
+                cert_date = datetime.strptime(cert_date_match.group(1), '%d/%m/%Y')
+                certificate_date = cert_date.strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+
+        # === EXTRACT ADDRESS AND OTHER DETAILS ===
+        address_lines = []
+        in_address_section = False
+        address_section_end = False
         
-        # Look for the specific section in the text
-        text_lower = text.lower()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            line_lower = line.lower()
+            
+            # Extract county
+            if "county:" in line_lower:
+                county = line.split(":")[-1].strip()
+                
+            # Extract district
+            if "district" in line_lower:
+                district = line.split(":")[-1].strip()
+                
+            # Extract postal code
+            if "postal code" in line_lower.replace(" ", ""):
+                postal_code = line.split(":")[-1].strip()
+                
+            # Extract registered address
+            if "registered address" in line_lower:
+                in_address_section = True
+                address_lines = []
+                continue
+                
+            if in_address_section and not address_section_end:
+                if any(section in line_lower for section in ["tax obligation", "economic activity"]):
+                    in_address_section = False
+                    address_section_end = True
+                else:
+                    # Clean up address line
+                    clean_line = re.sub(r'[^a-zA-Z0-9\s\-,]', '', line)
+                    if clean_line.strip():
+                        address_lines.append(clean_line.strip())
         
-        # Find the "Taxpayer Information" section
+        # Process address lines
+        if address_lines:
+            registered_address = {
+                "line1": address_lines[0] if len(address_lines) > 0 else "",
+                "line2": address_lines[1] if len(address_lines) > 1 else "",
+                "city": address_lines[2] if len(address_lines) > 2 else ""
+            }
+            
+        # === EXTRACT TAX OBLIGATIONS ===
+        tax_section = False
+        current_obligation = {}
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            line_lower = line.lower()
+            
+            if "tax obligation" in line_lower and "effective" in line_lower:
+                tax_section = True
+                continue
+                
+            if tax_section:
+                # Skip header lines
+                if any(header in line_lower for header in ["sr.no", "effective", "---"]):
+                    continue
+                    
+                # Split line into columns
+                columns = [col.strip() for col in re.split(r'\s{2,}', line) if col.strip()]
+                
+                if len(columns) >= 2:
+                    obligation = {
+                        "type": columns[1],
+                        "effective_from": columns[2] if len(columns) > 2 else "",
+                        "status": columns[3] if len(columns) > 3 else "Active"
+                    }
+                    tax_obligations.append(obligation)
+
+        # === IMPROVED TAXPAYER NAME EXTRACTION ===
+        
+        # Strategy 1: Look for name in "Taxpayer Information" section with label
         taxpayer_section_start = -1
         for i, line in enumerate(lines):
-            if "taxpayer information" in line.lower():
+            line_lower = line.lower()
+            if "taxpayer information" in line_lower:
                 taxpayer_section_start = i
                 break
         
         if taxpayer_section_start != -1:
-            # Look for taxpayer name in the lines after "Taxpayer Information"
-            for i in range(taxpayer_section_start + 1, min(taxpayer_section_start + 10, len(lines))):
+            # Look through the next few lines in the taxpayer information section
+            for i in range(taxpayer_section_start + 1, min(taxpayer_section_start + 8, len(lines))):
                 line = lines[i]
                 line_lower = line.lower()
                 
-                # Skip lines that are clearly section headers or labels
+                # Stop if we reach the next section
                 if any(section in line_lower for section in ["registered address", "tax obligation", "economic activity"]):
                     break
-                    
-                # Look for lines containing "taxpayer name" or variations
+                
+                # Look for taxpayer name label with variations
                 if any(pattern in line_lower for pattern in ["taxpayer name", "taxpayer namo", "taxpayer nam"]):
-                    # Extract the name part by removing the label
-                    name_line = re.sub(r'taxpayer\s*nam[eo]?\s*', '', line_lower, flags=re.IGNORECASE).strip()
-                    if name_line and not name_line.startswith(':'):
-                        # Convert back to proper case
-                        taxpayer_name = name_line
-                        break
-                    else:
-                        # Check next line for the name
-                        if i + 1 < len(lines):
-                            next_line = lines[i + 1].strip()
-                            if next_line and len(next_line) > 3:
-                                # Validate it looks like a name
-                                if (re.match(r'^[A-Za-z\s]+$', next_line) or 
-                                    re.match(r'^[A-Z\s]+$', next_line)):
-                                    taxpayer_name = next_line
-                                    break
+                    # Extract name from the same line after the label
+                    name_match = re.search(r'taxpayer\s*nam[eo]?\s*(.+)', line_lower, re.IGNORECASE)
+                    if name_match:
+                        extracted_name = name_match.group(1).strip()
+                        if extracted_name and len(extracted_name) > 3:
+                            taxpayer_name = extracted_name
+                            break
+                    
+                    # If no name on same line, check next line
+                    if not taxpayer_name and i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        if next_line and len(next_line) > 3:
+                            # Validate it looks like a name (not email, not section header)
+                            if (re.match(r'^[A-Za-z\s]+$', next_line) and 
+                                "@" not in next_line and 
+                                not any(keyword in next_line.lower() for keyword in ["email", "address", "registered"])):
+                                taxpayer_name = next_line
+                                break
 
-        # === ALTERNATIVE: Use spatial coordinates for precise extraction ===
+        # Strategy 2: If taxpayer name label is missing, look for name patterns in the section
+        if not taxpayer_name and taxpayer_section_start != -1:
+            for i in range(taxpayer_section_start + 1, min(taxpayer_section_start + 8, len(lines))):
+                line = lines[i]
+                line_lower = line.lower()
+                
+                # Stop if we reach the next section
+                if any(section in line_lower for section in ["registered address", "tax obligation", "economic activity"]):
+                    break
+                
+                # Skip lines that contain email addresses or are clearly labels
+                if "@" in line or any(label in line_lower for label in ["email", "address"]):
+                    continue
+                
+                # Look for typical name patterns (2-4 words, mostly letters)
+                words = line.split()
+                if 2 <= len(words) <= 4:
+                    # Check if all words look like name components
+                    name_like = all(re.match(r'^[A-Za-z\-]+$', word) for word in words)
+                    if name_like and len(line) > 5:
+                        taxpayer_name = line
+                        break
+
+        # Strategy 3: Spatial analysis for more precise extraction
         if not taxpayer_name:
             try:
                 data = pytesseract.image_to_data(
                     ocr_img, config=custom_config, output_type=pytesseract.Output.DICT
                 )
                 
-                # Find "Taxpayer Information" section coordinates
+                # Find coordinates of key sections
                 taxpayer_info_y = None
-                for i in range(len(data['text'])):
-                    text_lower = data['text'][i].lower().strip()
-                    if "taxpayer information" in text_lower:
-                        taxpayer_info_y = data['top'][i]
-                        break
+                email_y = None
                 
-                if taxpayer_info_y:
-                    # Look for text blocks below "Taxpayer Information" and above other sections
+                for i in range(len(data['text'])):
+                    text_item = data['text'][i].strip().lower()
+                    if "taxpayer information" in text_item:
+                        taxpayer_info_y = data['top'][i]
+                    elif "@" in data['text'][i] and "gmail.com" in text_item:
+                        email_y = data['top'][i]
+                
+                # If we found both sections, look for name between them
+                if taxpayer_info_y is not None and email_y is not None:
                     potential_names = []
                     for i in range(len(data['text'])):
                         text_item = data['text'][i].strip()
-                        if not text_item:
+                        if not text_item or len(text_item) < 2:
                             continue
                             
                         top_pos = data['top'][i]
                         left_pos = data['left'][i]
                         
-                        # Only consider text that's below taxpayer info and looks like it could be a name
-                        if (top_pos > taxpayer_info_y + 20 and 
-                            top_pos < taxpayer_info_y + 200 and  # Within reasonable distance
-                            left_pos > 100):  # Not too far left (avoid labels)
+                        # Look for text between taxpayer info and email sections
+                        if (top_pos > taxpayer_info_y + 30 and 
+                            top_pos < email_y - 10 and
+                            left_pos > 150):  # Right of labels
                             
                             # Check if it looks like a person's name
-                            if (re.match(r'^[A-Z][A-Za-z]+\s+[A-Z][A-Za-z]+\s+[A-Z][A-Za-z]+$', text_item) or
+                            if (re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+$', text_item) or
                                 re.match(r'^[A-Z]+\s+[A-Z]+\s+[A-Z]+$', text_item)):
-                                potential_names.append({
-                                    'text': text_item,
-                                    'top': top_pos,
-                                    'left': left_pos
-                                })
+                                # Additional validation: not a common label
+                                if text_item.lower() not in ["personal identification number", "certificate date", "taxpayer information"]:
+                                    potential_names.append({
+                                        'text': text_item,
+                                        'top': top_pos,
+                                        'confidence': data['conf'][i]
+                                    })
                     
-                    # Sort by position (top to bottom, left to right) and take the first valid name
+                    # Take the highest confidence name candidate
                     if potential_names:
-                        potential_names.sort(key=lambda x: (x['top'], x['left']))
+                        potential_names.sort(key=lambda x: x['confidence'], reverse=True)
                         taxpayer_name = potential_names[0]['text']
                         
             except Exception as e:
                 print(f"Spatial extraction failed: {e}")
 
-        # === FINAL FALLBACK: Direct search for name patterns ===
+        # Strategy 4: Direct pattern search in entire text
         if not taxpayer_name:
-            # Look for the specific name format in the raw text
-            name_patterns = [
-                r'JOHN\s+GIKANGA\s+NJUGI',
-                r'JOHN\s*GIKANGA\s*NJUGI',
-                r'[A-Z]{4,}\s+[A-Z]{4,}\s+[A-Z]{4,}'  # General pattern for 3 uppercase words
-            ]
+            # Look for typical Kenyan name patterns (2-4 uppercase words together)
+            name_pattern = r'\b([A-Z]{2,}(?:\s+[A-Z]{2,}){1,3})\b'
+            matches = re.findall(name_pattern, text)
             
-            for pattern in name_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    taxpayer_name = match.group(0).strip()
-                    break
+            # Filter out common false positives
+            valid_names = []
+            for match in matches:
+                candidate = match.strip()
+                # Exclude common false positives
+                if (len(candidate) > 5 and 
+                    candidate.lower() not in ["personal identification number", "kenya revenue authority", 
+                                            "tax obligation", "economic activity", "registered address",
+                                            "general tax questions", "kra call centre"] and
+                    not re.match(r'^[A-Z]\d', candidate) and  # Exclude PIN-like patterns
+                    "@" not in candidate):  # Exclude emails
+                    valid_names.append(candidate)
+            
+            if valid_names:
+                # Prefer longer names (more likely to be actual names)
+                valid_names.sort(key=len, reverse=True)
+                taxpayer_name = valid_names[0]
 
-        # === EMAIL EXTRACTION (keep your working version) ===
+        # === EMAIL EXTRACTION ===
         email_re = re.compile(
             r'[A-Z0-9._%+-]+\s*@\s*[A-Z0-9.-]+\s*\.\s*[A-Z]{2,}',
             re.IGNORECASE
@@ -330,13 +544,16 @@ async def extract_kra_pin_details(
         
         if not email_address:
             for line in lines:
-                if "@" in line and "GMAIL.COM" in line.upper():
+                if "@" in line and any(domain in line.upper() for domain in ["GMAIL.COM", "YAHOO.COM", "HOTMAIL.COM"]):
                     email_match = email_re.search(line)
                     if email_match:
-                        email_address = re.sub(r'\s+', '', email_match.group(0)).upper()
-                        break
+                        candidate_email = re.sub(r'\s+', '', email_match.group(0)).upper()
+                        # Skip KRA official emails
+                        if "kra.go.ke" not in candidate_email.lower():
+                            email_address = candidate_email
+                            break
 
-        # === PIN EXTRACTION (keep your working version) ===
+        # === PIN EXTRACTION ===
         pin_re = re.compile(r'[A-Z]\s*\d{3}\s*\d{3}\s*\d{3}\s*[A-Z]', re.IGNORECASE)
         
         if not personal_identification_number:
@@ -350,27 +567,29 @@ async def extract_kra_pin_details(
 
         # === CLEANUP ===
         if taxpayer_name:
-            # Remove any non-name characters but preserve letters, spaces, hyphens, apostrophes
+            # Remove any non-name characters
             taxpayer_name = re.sub(r'[^A-Za-z\s\'’-]', ' ', taxpayer_name).strip()
-            taxpayer_name = re.sub(r'\s+', ' ', taxpayer_name)  # Normalize spaces
+            taxpayer_name = re.sub(r'\s+', ' ', taxpayer_name)
             
             # Capitalize properly
-            if taxpayer_name.isupper():
+            if taxpayer_name and taxpayer_name.isupper():
                 taxpayer_name = ' '.join(word.capitalize() for word in taxpayer_name.split())
-            else:
-                # Ensure proper title case
-                taxpayer_name = ' '.join(word.capitalize() if word.isupper() else word 
-                                       for word in taxpayer_name.split())
 
         processing_time = time.time() - start_time
 
         return {
             "taxpayer_name": taxpayer_name,
             "email_address": email_address,
-            "personal_identification_number": personal_identification_number,
+            "kra_pin": personal_identification_number,
+            "certificate_date": certificate_date,
+            "registered_address": registered_address,
+            "county": county,
+            "district": district,
+            "postal_code": postal_code,
+            "tax_obligations": tax_obligations,
             "processing_time": processing_time,
             "engine_used": "tesseract",
-            "raw_text": text
+            "raw_text": text if include_raw.lower() == "true" else None
         }
 
     except Exception as e:

@@ -86,6 +86,18 @@ class KRAPINResponse(BaseModel):
     taxpayer_name: Optional[str] = Field(None, description="Tax Payer Name as printed on the certificate")
     email_address: Optional[str] = Field(None, description="Email Address on the certificate")
     personal_identification_number: Optional[str] = Field(None, description="KRA Personal Identification Number (PIN)")
+    certificate_date: Optional[str] = Field(None, description="Date when the certificate was issued (YYYY-MM-DD format)")
+    registered_address: Optional[Dict[str, str]] = Field(
+        None,
+        description="Structured address information containing line1, line2, and city"
+    )
+    county: Optional[str] = Field(None, description="County of residence")
+    district: Optional[str] = Field(None, description="District of residence")
+    postal_code: Optional[str] = Field(None, description="Postal code")
+    tax_obligations: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="List of tax obligations with type, effective_from, and status"
+    )
     processing_time: float = Field(..., description="Time taken to process the document in seconds", gt=0)
     engine_used: str = Field(..., description="The OCR engine used for text extraction")
     raw_text: Optional[str] = Field(None, description="Raw OCR text (useful for debugging)")
@@ -96,7 +108,28 @@ class KRAPINResponse(BaseModel):
                 "taxpayer_name": "DUKE NYARAKE NYASING'A",
                 "email_address": "NYASINGADUKE@GMAIL.COM",
                 "personal_identification_number": "A007341474P",
-                "processing_time": 0.95,
+                "certificate_date": "2023-05-15",
+                "registered_address": {
+                    "line1": "123 MAIN STREET",
+                    "line2": "P.O. BOX 12345",
+                    "city": "NAIROBI"
+                },
+                "county": "NAIROBI",
+                "district": "WESTLANDS",
+                "postal_code": "00100",
+                "tax_obligations": [
+                    {
+                        "type": "VAT",
+                        "effective_from": "01/01/2020",
+                        "status": "Active"
+                    },
+                    {
+                        "type": "PAYE",
+                        "effective_from": "01/01/2020",
+                        "status": "Active"
+                    }
+                ],
+                "processing_time": 1.25,
                 "engine_used": "tesseract",
                 "raw_text": "..."
             }

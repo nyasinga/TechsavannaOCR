@@ -1,2 +1,2 @@
-# TechsavannaOCR
+# OCR
 POC OCR
